@@ -1,0 +1,44 @@
+# --- Secrets ---
+.env
+.env.local
+.env.*.local
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Conda ---
+.conda/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# --- Downloaded data (re-fetch with `python -m src.download`) ---
+data/*.json
+data/*.csv
+data/*.parquet
+data/*.geojson
+!data/.gitkeep
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+*.log
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+*.swo

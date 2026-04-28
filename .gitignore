@@ -25,11 +25,12 @@ ENV/
 .ipynb_checkpoints/
 *.nbconvert.ipynb
 
-# --- Downloaded data (re-fetch with `python -m src.download`) ---
+# --- Downloaded data (re-fetch with `python -m src.download*`) ---
 data/*.json
 data/*.csv
 data/*.parquet
 data/*.geojson
+data/photos/
 !data/.gitkeep
 
 # --- OS ---

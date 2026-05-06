@@ -31,7 +31,7 @@ data/*.csv
 data/*.parquet
 data/*.geojson
 data/photos/
-data/citywide/
+data/citywide/images/
 
 !data/.gitkeep
 

@@ -23,7 +23,6 @@ import argparse
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
 
 import pandas as pd
 
@@ -43,58 +42,82 @@ PROFILES: dict[int, str] = {
 # ---------- step 1: assets + attributes + file metadata ----------------
 
 
-def _fetch_asset_meta(client: CitywideClient, asset_id: int, pid: int
-                      ) -> tuple[list[dict], list[dict]]:
-    """Fetch attributes + attached_files for a single asset."""
-    attrs: list[dict] = []
-    files: list[dict] = []
-    r = client.get(f"/assets/{asset_id}/attributes")
-    if r.status_code == 200:
-        for at in r.json():
-            at["asset_id"] = asset_id
-            at["profile_id"] = pid
-            attrs.append(at)
-    r = client.get(f"/assets/{asset_id}/attached_files")
-    if r.status_code == 200:
-        for f in r.json():
-            f["asset_id"] = asset_id
-            f["profile_id"] = pid
-            files.append(f)
-    return attrs, files
+def _save_profile(pid: int, assets: list[dict], attrs: list[dict], files: list[dict]) -> None:
+    """Persist per-profile metadata so a partial run is not lost."""
+    pdir = DATA_DIR / "by_profile" / str(pid)
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "assets.json").write_text(json.dumps(assets, indent=2, default=str))
+    (pdir / "attributes.json").write_text(json.dumps(attrs, indent=2, default=str))
+    (pdir / "files.json").write_text(json.dumps(files, indent=2, default=str))
 
 
-def fetch_metadata(client: CitywideClient, workers: int = 8
-                   ) -> tuple[list[dict], list[dict], list[dict]]:
-    """Return (assets, attributes, files_metadata) for every target asset."""
+def fetch_metadata(client: CitywideClient) -> tuple[list[dict], list[dict], list[dict]]:
+    """Return (assets, attributes, files_metadata) for every target asset.
+
+    Uses /bulk/assets?$linked=Attributes,Files which returns each asset
+    together with its inline attributes and attached-file metadata in a
+    single response — collapsing what would otherwise be 9000+ calls into
+    ~95 list pages. Writes per-profile snapshots to
+    data/citywide/by_profile/<pid>/ as it goes (resume-safe).
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     assets: list[dict] = []
     attributes: list[dict] = []
     files: list[dict] = []
 
     for pid, pname in PROFILES.items():
-        print(f"\n[{pid}] {pname}")
-        profile_assets = list(client.list_all("/assets", {"profile_id": pid}))
-        print(f"  fetched {len(profile_assets)} assets")
-        for a in profile_assets:
+        # Resume: skip profile if already saved
+        pdir = DATA_DIR / "by_profile" / str(pid)
+        if (pdir / "files.json").exists():
+            p_assets = json.loads((pdir / "assets.json").read_text())
+            p_attrs  = json.loads((pdir / "attributes.json").read_text())
+            p_files  = json.loads((pdir / "files.json").read_text())
+            assets.extend(p_assets); attributes.extend(p_attrs); files.extend(p_files)
+            print(f"\n[{pid}] {pname}  (already cached: {len(p_assets)} assets)", flush=True)
+            continue
+
+        print(f"\n[{pid}] {pname}", flush=True)
+        p_assets: list[dict] = []
+        p_attrs: list[dict] = []
+        p_files: list[dict] = []
+        # /bulk/assets supports $linked=Attributes (TitleCase keys) but
+        # NOT Files — so we get attributes inline here, and fetch
+        # attached_files separately afterwards.
+        for a in client.list_all(
+            "/bulk/assets",
+            {"profile_id": pid, "$linked": "Attributes"},
+        ):
+            aid = a["id"]
             a["profile_id_used"] = pid
             a["profile_name"] = pname
-        assets.extend(profile_assets)
+            linked = a.pop("linked", {}) or {}
+            for at in (linked.get("Attributes") or []):
+                at["asset_id"] = aid
+                at["profile_id"] = pid
+                p_attrs.append(at)
+            p_assets.append(a)
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {pool.submit(_fetch_asset_meta, client, a["id"], pid): a
-                    for a in profile_assets}
-            done = 0
-            for fut in as_completed(futs):
-                attrs, fs = fut.result()
-                attributes.extend(attrs)
-                files.extend(fs)
-                done += 1
-                if done % 100 == 0 or done == len(profile_assets):
-                    print(f"  meta: {done}/{len(profile_assets)}")
+        # Now fetch attached_files for each asset (one call each).
+        # NB: this is the expensive step (~1 call per asset). The script
+        # is resume-safe at the profile level.
+        print(f"  fetched {len(p_assets)} assets, {len(p_attrs)} attrs; "
+              f"now fetching attached_files metadata...", flush=True)
+        for i, a in enumerate(p_assets, 1):
+            r = client.get(f"/assets/{a['id']}/attached_files")
+            if r.status_code == 200:
+                for f in r.json():
+                    f["asset_id"] = a["id"]
+                    f["profile_id"] = pid
+                    p_files.append(f)
+            if i % 100 == 0 or i == len(p_assets):
+                print(f"    files: {i}/{len(p_assets)}  total_files={len(p_files)}",
+                      flush=True)
 
-        n_attr = sum(1 for at in attributes if at['profile_id'] == pid)
-        n_file = sum(1 for f in files if f['profile_id'] == pid)
-        print(f"  done: {len(profile_assets)} assets, "
-              f"{n_attr} attribute rows, {n_file} file records")
+        _save_profile(pid, p_assets, p_attrs, p_files)
+        assets.extend(p_assets); attributes.extend(p_attrs); files.extend(p_files)
+        print(f"  done: {len(p_assets)} assets, {len(p_attrs)} attrs, "
+              f"{len(p_files)} files  -> data/citywide/by_profile/{pid}/",
+              flush=True)
 
     return assets, attributes, files
 
@@ -177,26 +200,84 @@ def download_images(client: CitywideClient, files: list[dict],
 # ---------- main -------------------------------------------------------
 
 
+def probe_quota(client: CitywideClient) -> None:
+    """Spend 1 call to read rate-limit headers."""
+    r = client.get("/users", params={"$limit": 1})
+    print(f"  status: {r.status_code}")
+    for h in ("X-Total", "X-Rate-Limit-Limit", "X-Rate-Limit-Remaining",
+              "X-Rate-Limit-Reset", "Retry-After"):
+        v = r.headers.get(h)
+        if v:
+            print(f"  {h}: {v}")
+    # Print all headers starting with X- in case the names differ
+    print("\n  all X-/Retry- headers:")
+    for k, v in r.headers.items():
+        if k.lower().startswith(("x-", "retry-")):
+            print(f"    {k}: {v}")
+
+
+def consolidate_metadata() -> None:
+    """Read every per-profile snapshot and write the combined CSVs."""
+    assets: list[dict] = []
+    attrs: list[dict] = []
+    files: list[dict] = []
+    by_profile = DATA_DIR / "by_profile"
+    if not by_profile.exists():
+        return
+    for pdir in sorted(by_profile.iterdir()):
+        if not (pdir / "files.json").exists():
+            continue
+        assets.extend(json.loads((pdir / "assets.json").read_text()))
+        attrs.extend(json.loads((pdir / "attributes.json").read_text()))
+        files.extend(json.loads((pdir / "files.json").read_text()))
+    if assets:
+        save_metadata(assets, attrs, files)
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
+    p.add_argument("--profile", type=int, default=None,
+                   help="Run only this profile_id (one of: "
+                        + ", ".join(f"{k}={v}" for k, v in PROFILES.items()) + ")")
     p.add_argument("--metadata-only", action="store_true",
                    help="Skip image binary download")
     p.add_argument("--images-only", action="store_true",
-                   help="Skip metadata fetch — re-use existing files_manifest.json")
-    p.add_argument("--workers", type=int, default=8)
+                   help="Skip metadata fetch — use cached per-profile JSON")
+    p.add_argument("--workers", type=int, default=4)
     p.add_argument("--limit", type=int, default=0,
                    help="If >0, only download first N files (for sampling)")
+    p.add_argument("--max-calls-per-hour", type=int, default=900,
+                   help="Client-side rate limit (server cap is 1000/hr)")
+    p.add_argument("--probe", action="store_true",
+                   help="Issue 1 call and print rate-limit headers")
     args = p.parse_args()
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    with CitywideClient() as client:
+    # Optionally restrict to a single profile
+    if args.profile is not None:
+        if args.profile not in PROFILES:
+            raise SystemExit(f"--profile must be one of {list(PROFILES)}")
+        only = {args.profile: PROFILES[args.profile]}
+        PROFILES.clear()
+        PROFILES.update(only)
+
+    with CitywideClient(max_calls_per_hour=args.max_calls_per_hour) as client:
+        if args.probe:
+            probe_quota(client)
+            return
+
         if not args.images_only:
             assets, attrs, files = fetch_metadata(client)
-            save_metadata(assets, attrs, files)
         else:
-            files = json.loads((DATA_DIR / "files_manifest.json").read_text())
-            print(f"Loaded {len(files)} files from manifest")
+            files = []
+            for pid in PROFILES:
+                pdir = DATA_DIR / "by_profile" / str(pid)
+                if (pdir / "files.json").exists():
+                    files.extend(json.loads((pdir / "files.json").read_text()))
+            print(f"Loaded {len(files)} files from cache")
+
+        consolidate_metadata()
 
         if args.metadata_only:
             return
